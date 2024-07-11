@@ -1,0 +1,162 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <ares.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/time.h>
+#include <unistd.h>
+#include <string.h>
+
+/* 
+sudo apt-get update
+sudo apt-get install libc-ares-dev
+gcc -o dns_resolver main.c -lcares
+./dns_resolver
+if success will output :
+IP address for www.example.com: 93.184.216.34
+*/
+
+#define DNSP_IP_MAX 128
+void ntp_debug(const char *fmt, ...);
+char *ntp_get_addr_by_domain_bk(const char *domain);
+// 只定义一个简单的调试输出函数
+void ntp_debug(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+}
+
+// 异步查询函数
+static void query_callback_bk(void *arg, int status, int timeouts, struct hostent *hostent)
+{
+    char *ipaddr = NULL;
+    static char host_ip[DNSP_IP_MAX] = {0};
+
+    if (!arg) {
+        ntp_debug(stderr, "error! arg is NULL!\n");
+        return;
+    }
+
+    if (status == ARES_SUCCESS && hostent && hostent->h_addr_list[0]) {
+        switch (hostent->h_addrtype) {
+        case AF_INET:
+            ipaddr = inet_ntoa(*(struct in_addr *)hostent->h_addr_list[0]);
+            ntp_debug("find IPv4:%s\n", ipaddr);
+            break;
+        case AF_INET6: {
+            char ip6[INET6_ADDRSTRLEN];
+            inet_ntop(AF_INET6, hostent->h_addr_list[0], ip6, sizeof(ip6));
+            ipaddr = ip6;
+            ntp_debug("find IPv6:%s\n", ipaddr);
+            break;
+        }
+        default:
+            ntp_debug("unknow ip addr!\n");
+            break;
+        }
+    } else {
+        ntp_debug("find failed address error:%s\n", ares_strerror(status));
+    }
+
+    if (ipaddr) {
+        strncpy(host_ip, ipaddr, sizeof(host_ip) - 1);
+        host_ip[sizeof(host_ip) - 1] = '\0';
+    }
+
+    *((char **)arg) = host_ip;
+}
+
+#define GLOBAL_TIMEOUT 2  // 设置全局超时时间为2秒
+
+// getaddrinfo 函数会阻塞, 这里使用异步方式解决阻塞问题
+char *ntp_get_addr_by_domain_bk(const char *domain)
+{
+    char *ipaddr = NULL;
+    static char host_ip[DNSP_IP_MAX] = {0};
+    int status;
+    ares_channel channel;
+	struct timeval start, end;
+
+    memset(host_ip, 0, sizeof(host_ip));
+
+    // 初始化c-ares库
+    status = ares_library_init(ARES_LIB_INIT_ALL);
+    if (status != ARES_SUCCESS) {
+        ntp_debug("c-ares ares_library_init failed, error:%s\n", ares_strerror(status));
+        return NULL;
+    }
+
+    // 初始化ares_channel
+    status = ares_init(&channel);
+    if (status != ARES_SUCCESS) {
+        ntp_debug("c-ares ares_init failed, error:%s\n", ares_strerror(status));
+        ares_library_cleanup();
+        return NULL;
+    }
+
+    // 执行异步DNS查询
+    ares_gethostbyname(channel, domain, AF_UNSPEC, query_callback_bk, &ipaddr);
+
+    // 获取当前时间
+    gettimeofday(&start, NULL);
+	int count = 0;
+    // 处理c-ares的事件循环，直到查询完成或超时
+    while (!ipaddr) {
+        fd_set read_fds, write_fds;
+        struct timeval tvp;
+        int nfds = 0;
+		struct timeval custom_timeout, ares_timeout_val;
+
+        FD_ZERO(&read_fds);
+        FD_ZERO(&write_fds);
+        nfds = ares_fds(channel, &read_fds, &write_fds);
+        if (nfds == 0)
+			break; // 没有文件描述符需要处理
+
+        // 计算全局超时时间
+        gettimeofday(&end, NULL);
+        if ((end.tv_sec - start.tv_sec) >= GLOBAL_TIMEOUT) {
+            ntp_debug("find time out 2s!\n");
+            break;
+        }
+
+		// ares_timeout 返回的超时时间是两个参数的最小值,这里让tvp 最大返回1s,防止select阻塞
+        custom_timeout.tv_sec = 1;
+        custom_timeout.tv_usec = 0;
+		tvp = ares_timeout(channel,  &custom_timeout, &ares_timeout_val);
+
+        // select是 c-ares 库设计的标准使用方式,可确保 DNS 查询尽可能可靠地完成
+        if (select(nfds, &read_fds, &write_fds, NULL, &tvp) == -1) {
+            ntp_debug("select error!!!");
+            break;
+        }
+		   // 触发相应的回调函数 query_callback
+        ares_process(channel, &read_fds, &write_fds);
+
+        // 最多处理6次循环结束
+        if (++count > 6) {
+            ntp_debug("find count is more than six, break!\n");
+            break;
+        }
+    }
+
+    // 清理c-ares资源
+    ares_destroy(channel);
+    ares_library_cleanup();
+
+    return ipaddr;
+}
+int main() {
+    const char *domain = "www.example.com";
+    char *ip_address = ntp_get_addr_by_domain_bk(domain);
+
+    if (ip_address) {
+        printf("IP address for %s: %s\n", domain, ip_address);
+    } else {
+        printf("Failed to get IP address for %s\n", domain);
+    }
+    return 0;
+}
+
+
